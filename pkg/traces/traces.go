@@ -4,17 +4,12 @@ import (
 	"fmt"
 	"sync"
 
-	"contrib.go.opencensus.io/exporter/prometheus"
 	"github.com/go-kit/log"
 	"github.com/grafana/agent/pkg/logs"
 	"github.com/grafana/agent/pkg/metrics/instance"
 	"github.com/grafana/agent/pkg/util/zapadapter"
 	prom_client "github.com/prometheus/client_golang/prometheus"
-	"go.opencensus.io/stats/view"
-	"go.opentelemetry.io/collector/external/obsreportconfig"
 	"go.uber.org/zap"
-
-	"go.opentelemetry.io/collector/config/configtelemetry"
 )
 
 // Traces wraps the OpenTelemetry collector to enable tracing pipelines
@@ -64,7 +59,8 @@ func (t *Traces) ApplyConfig(logsSubsystem *logs.Logs, promInstanceManager insta
 
 		// If an old instance exists, update it and move it to the new map.
 		if old, ok := t.instances[c.Name]; ok {
-			err := old.ApplyConfig(logsSubsystem, promInstanceManager, instReg, c)
+			//TODO: Make sure we test this code path
+			err := old.ApplyConfig(logsSubsystem, promInstanceManager, c, instReg)
 			if err != nil {
 				return err
 			}
@@ -77,7 +73,7 @@ func (t *Traces) ApplyConfig(logsSubsystem *logs.Logs, promInstanceManager insta
 			instLogger = t.logger.With(zap.String("traces_config", c.Name))
 		)
 
-		inst, err := NewInstance(logsSubsystem, instReg, c, instLogger, t.promInstanceManager)
+		inst, err := NewInstance(logsSubsystem, c, instLogger, t.promInstanceManager, instReg)
 		if err != nil {
 			return fmt.Errorf("failed to create tracing instance %s: %w", c.Name, err)
 		}
@@ -115,22 +111,22 @@ func newLogger(l log.Logger) *zap.Logger {
 	return logger
 }
 
-func newMetricViews(reg prom_client.Registerer) ([]*view.View, error) {
-	obsMetrics := obsreportconfig.Configure(configtelemetry.LevelBasic)
-	err := view.Register(obsMetrics.Views...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to register views: %w", err)
-	}
+// func newMetricViews(reg prom_client.Registerer) ([]*view.View, error) {
+// 	obsMetrics := obsreportconfig.AllViews(configtelemetry.LevelBasic)
+// 	err := view.Register(obsMetrics...)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to register views: %w", err)
+// 	}
 
-	pe, err := prometheus.NewExporter(prometheus.Options{
-		Namespace:  "traces",
-		Registerer: reg,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create prometheus exporter: %w", err)
-	}
+// 	pe, err := prometheus.NewExporter(prometheus.Options{
+// 		Namespace:  "traces",
+// 		Registerer: reg,
+// 	})
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to create prometheus exporter: %w", err)
+// 	}
 
-	view.RegisterExporter(pe)
+// 	view.RegisterExporter(pe)
 
-	return obsMetrics.Views, nil
-}
+// 	return obsMetrics, nil
+// }

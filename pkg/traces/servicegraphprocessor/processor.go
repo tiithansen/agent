@@ -2,6 +2,7 @@ package servicegraphprocessor
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -9,14 +10,38 @@ import (
 	util "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/agent/pkg/traces/contextkeys"
-	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	otelprocessor "go.opentelemetry.io/collector/processor"
 	semconv "go.opentelemetry.io/collector/semconv/v1.6.1"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/aggregation"
 	"google.golang.org/grpc/codes"
 )
+
+// TODO: Do we need the component name in the metric name?
+// TODO: Should the metric name be unique if there are multiple service graph processors?
+// TODO: Make these const?
+// TODO: Not sure what are good variable names for this?
+// TODO: There used to be a <Namespace: "traces">. Is there an Otel equivalent of it?
+// TODO: If there is no namespace equivalent, should  we make "traces" a global variable that we reference from everywhere?
+// TODO: Otel adds a "_total" automatically, so I had to remove it. Can er disable this in otel?
+var serviceGraphRequestTotal_name = "traces_service_graph_request"
+var serviceGraphRequestFailedTotal_name = "traces_service_graph_request_failed"
+var serviceGraphRequestServerHistogram_name = "traces_service_graph_request_server_seconds"
+var serviceGraphRequestClientHistogram_name = "traces_service_graph_request_client_seconds"
+var serviceGraphUnpairedSpansTotal_name = "traces_service_graph_unpaired_spans"
+var serviceGraphDroppedSpansTotal_name = "traces_service_graph_dropped_spans"
+
+// var serviceGraphRequestTotal_name = "traces_service_graph_request_total"
+// var serviceGraphRequestFailedTotal_name = "traces_service_graph_request_failed_total"
+// var serviceGraphRequestServerHistogram_name = "traces_service_graph_request_server_seconds"
+// var serviceGraphRequestClientHistogram_name = "traces_service_graph_request_client_seconds"
+// var serviceGraphUnpairedSpansTotal_name = "traces_service_graph_unpaired_spans_total"
+// var serviceGraphDroppedSpansTotal_name = "traces_service_graph_dropped_spans_total"
 
 type tooManySpansError struct {
 	droppedSpans int
@@ -59,11 +84,10 @@ func (e *edge) isExpired() bool {
 	return time.Now().Unix() >= e.expiration
 }
 
-var _ component.TracesProcessor = (*processor)(nil)
+var _ otelprocessor.Traces = (*processor)(nil)
 
 type processor struct {
 	nextConsumer consumer.Traces
-	reg          prometheus.Registerer
 
 	store *store
 
@@ -73,21 +97,23 @@ type processor struct {
 	// completed edges are pushed through this channel to be processed.
 	collectCh chan string
 
-	serviceGraphRequestTotal           *prometheus.CounterVec
-	serviceGraphRequestFailedTotal     *prometheus.CounterVec
-	serviceGraphRequestServerHistogram *prometheus.HistogramVec
-	serviceGraphRequestClientHistogram *prometheus.HistogramVec
-	serviceGraphUnpairedSpansTotal     *prometheus.CounterVec
-	serviceGraphDroppedSpansTotal      *prometheus.CounterVec
+	serviceGraphRequestTotal           metric.Float64Counter
+	serviceGraphRequestFailedTotal     metric.Float64Counter
+	serviceGraphRequestServerHistogram metric.Float64Histogram
+	serviceGraphRequestClientHistogram metric.Float64Histogram
+	serviceGraphUnpairedSpansTotal     metric.Float64Counter
+	serviceGraphDroppedSpansTotal      metric.Float64Counter
 
 	httpSuccessCodeMap map[int]struct{}
 	grpcSuccessCodeMap map[int]struct{}
 
 	logger  log.Logger
 	closeCh chan struct{}
+
+	meterId string
 }
 
-func newProcessor(nextConsumer consumer.Traces, cfg *Config) *processor {
+func newProcessor(nextConsumer consumer.Traces, cfg *Config, set otelprocessor.CreateSettings) *processor {
 	logger := log.With(util.Logger, "component", "service graphs")
 
 	if cfg.Wait == 0 {
@@ -125,6 +151,9 @@ func newProcessor(nextConsumer consumer.Traces, cfg *Config) *processor {
 		collectCh: make(chan string, cfg.Workers),
 
 		closeCh: make(chan struct{}, 1),
+
+		//TODO: Use this ot prefix the metric names?
+		meterId: set.ID.String(),
 	}
 
 	for i := 0; i < cfg.Workers; i++ {
@@ -141,91 +170,148 @@ func newProcessor(nextConsumer consumer.Traces, cfg *Config) *processor {
 		}()
 	}
 
+	err := p.registerMetrics(set.MeterProvider)
+	if err != nil {
+		panic(err)
+		//TODO: Should we panic?
+		// level.Error(logger).Log("msg", "failed to register Otel metrics", "err", err)
+		// return nil
+	} else {
+		//TODO: Do we want to log this?
+		level.Info(logger).Log("msg", "successfully registered Otel metrics")
+		//TODO: The logger doesn't include the config name?
+		// ts=2023-04-17T17:15:11.772899Z caller=processor.go:171 level=info component="service graphs" msg="successfully registered Otel metrics"
+	}
+
 	return p
 }
 
-func (p *processor) Start(ctx context.Context, _ component.Host) error {
+func (p *processor) Start(_ context.Context, _ component.Host) error {
 	// initialize store
 	p.store = newStore(p.wait, p.maxItems, p.collectEdge)
 
-	reg, ok := ctx.Value(contextkeys.PrometheusRegisterer).(prometheus.Registerer)
-	if !ok || reg == nil {
-		return fmt.Errorf("key does not contain a prometheus registerer")
-	}
-	p.reg = reg
-	return p.registerMetrics()
+	//TODO: Check if the metrics are nil and error if they are?
+
+	return nil
 }
 
-func (p *processor) registerMetrics() error {
-	p.serviceGraphRequestTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "traces",
-		Name:      "service_graph_request_total",
-		Help:      "Total count of requests between two nodes",
-	}, []string{"client", "server"})
-	p.serviceGraphRequestFailedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "traces",
-		Name:      "service_graph_request_failed_total",
-		Help:      "Total count of failed requests between two nodes",
-	}, []string{"client", "server"})
-	p.serviceGraphRequestServerHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: "traces",
-		Name:      "service_graph_request_server_seconds",
-		Help:      "Time for a request between two nodes as seen from the server",
-		Buckets:   prometheus.ExponentialBuckets(0.01, 2, 12),
-	}, []string{"client", "server"})
-	p.serviceGraphRequestClientHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: "traces",
-		Name:      "service_graph_request_client_seconds",
-		Help:      "Time for a request between two nodes as seen from the client",
-		Buckets:   prometheus.ExponentialBuckets(0.01, 2, 12),
-	}, []string{"client", "server"})
-	p.serviceGraphUnpairedSpansTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "traces",
-		Name:      "service_graph_unpaired_spans_total",
-		Help:      "Total count of unpaired spans",
-	}, []string{"client", "server"})
-	p.serviceGraphDroppedSpansTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "traces",
-		Name:      "service_graph_dropped_spans_total",
-		Help:      "Total count of dropped spans",
-	}, []string{"client", "server"})
+// TODO: This function needs to have a prefix to attach to the metric name?
+func OtelMetricViews() []sdkmetric.View {
+	return []sdkmetric.View{
+		sdkmetric.NewView(
+			sdkmetric.Instrument{Name: serviceGraphRequestServerHistogram_name},
+			sdkmetric.Stream{Aggregation: aggregation.ExplicitBucketHistogram{
+				//TODO: Are these buckets the same as the Prometheus ExponentialBuckets?
+				Boundaries: []float64{0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48},
+			}},
+		),
+		sdkmetric.NewView(
+			sdkmetric.Instrument{Name: serviceGraphRequestClientHistogram_name},
+			sdkmetric.Stream{Aggregation: aggregation.ExplicitBucketHistogram{
+				//TODO: Are these buckets the same as the Prometheus ExponentialBuckets?
+				Boundaries: []float64{0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48},
+			}},
+		),
+	}
+}
 
-	cs := []prometheus.Collector{
-		p.serviceGraphRequestTotal,
-		p.serviceGraphRequestFailedTotal,
-		p.serviceGraphRequestServerHistogram,
-		p.serviceGraphRequestClientHistogram,
-		p.serviceGraphUnpairedSpansTotal,
-		p.serviceGraphDroppedSpansTotal,
+func (p *processor) registerMetrics(mp metric.MeterProvider) error {
+	//TODO: What is a good meter name?
+	meter := mp.Meter(p.meterId)
+
+	//TODO: Is this a good way to init the error var? If we use "var err error = nil", there is a lint error "ineffectual assignment to err (ineffassign)"
+	err := error(nil)
+	//TODO: How to add a namespace of "traces"?
+	p.serviceGraphRequestTotal, err = meter.Float64Counter(
+		serviceGraphRequestTotal_name,
+		metric.WithDescription("Total count of requests between two nodes"),
+	)
+	if err != nil {
+		return err
 	}
 
-	for _, c := range cs {
-		if err := p.reg.Register(c); err != nil {
-			return err
-		}
+	p.serviceGraphRequestFailedTotal, err = meter.Float64Counter(
+		serviceGraphRequestFailedTotal_name,
+		metric.WithDescription("Total count of failed requests between two nodes"),
+	)
+	if err != nil {
+		return err
 	}
 
+	p.serviceGraphRequestServerHistogram, err = meter.Float64Histogram(
+		serviceGraphRequestServerHistogram_name,
+		metric.WithDescription("Time for a request between two nodes as seen from the server"),
+	)
+	if err != nil {
+		return err
+	}
+
+	p.serviceGraphRequestClientHistogram, err = meter.Float64Histogram(
+		serviceGraphRequestClientHistogram_name,
+		metric.WithDescription("Time for a request between two nodes as seen from the client"),
+	)
+	if err != nil {
+		return err
+	}
+
+	p.serviceGraphUnpairedSpansTotal, err = meter.Float64Counter(
+		serviceGraphUnpairedSpansTotal_name,
+		metric.WithDescription("Total count of unpaired spans"),
+	)
+	if err != nil {
+		return err
+	}
+
+	p.serviceGraphDroppedSpansTotal, err = meter.Float64Counter(
+		serviceGraphDroppedSpansTotal_name,
+		metric.WithDescription("Total count of dropped spans"),
+	)
+	if err != nil {
+		return err
+	}
+
+	//TODO: Delete this later
+
+	// p.serviceGraphRequestTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	// 	Namespace: "traces",
+	// 	Name:      "service_graph_request_total",
+	// 	Help:      "Total count of requests between two nodes",
+	// }, []string{"client", "server"})
+	// p.serviceGraphRequestFailedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	// 	Namespace: "traces",
+	// 	Name:      "service_graph_request_failed_total",
+	// 	Help:      "Total count of failed requests between two nodes",
+	// }, []string{"client", "server"})
+	// p.serviceGraphRequestServerHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	// 	Namespace: "traces",
+	// 	Name:      "service_graph_request_server_seconds",
+	// 	Help:      "Time for a request between two nodes as seen from the server",
+	// 	Buckets:   prometheus.ExponentialBuckets(0.01, 2, 12),
+	// }, []string{"client", "server"})
+	// p.serviceGraphRequestClientHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	// 	Namespace: "traces",
+	// 	Name:      "service_graph_request_client_seconds",
+	// 	Help:      "Time for a request between two nodes as seen from the client",
+	// 	Buckets:   prometheus.ExponentialBuckets(0.01, 2, 12),
+	// }, []string{"client", "server"})
+	// p.serviceGraphUnpairedSpansTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	// 	Namespace: "traces",
+	// 	Name:      "service_graph_unpaired_spans_total",
+	// 	Help:      "Total count of unpaired spans",
+	// }, []string{"client", "server"})
+	// p.serviceGraphDroppedSpansTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	// 	Namespace: "traces",
+	// 	Name:      "service_graph_dropped_spans_total",
+	// 	Help:      "Total count of dropped spans",
+	// }, []string{"client", "server"})
+
+	//TODO: Do we have to unregister the metrics at any point?
 	return nil
 }
 
 func (p *processor) Shutdown(context.Context) error {
 	close(p.closeCh)
-	p.unregisterMetrics()
 	return nil
-}
-
-func (p *processor) unregisterMetrics() {
-	cs := []prometheus.Collector{
-		p.serviceGraphRequestTotal,
-		p.serviceGraphRequestFailedTotal,
-		p.serviceGraphRequestServerHistogram,
-		p.serviceGraphRequestClientHistogram,
-		p.serviceGraphUnpairedSpansTotal,
-	}
-
-	for _, c := range cs {
-		p.reg.Unregister(c)
-	}
 }
 
 func (p *processor) Capabilities() consumer.Capabilities {
@@ -251,15 +337,22 @@ func (p *processor) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
 // collectEdge records the metrics for the given edge.
 // Returns true if the edge is completed or expired and should be deleted.
 func (p *processor) collectEdge(e *edge) {
+	//TODO: What is a good context to use?
+	ctx := context.Background()
+	attrs := []attribute.KeyValue{
+		attribute.Key("client").String(e.clientService),
+		attribute.Key("server").String(e.serverService),
+	}
+
 	if e.isCompleted() {
-		p.serviceGraphRequestTotal.WithLabelValues(e.clientService, e.serverService).Inc()
+		p.serviceGraphRequestTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
 		if e.failed {
-			p.serviceGraphRequestFailedTotal.WithLabelValues(e.clientService, e.serverService).Inc()
+			p.serviceGraphRequestFailedTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
 		}
-		p.serviceGraphRequestServerHistogram.WithLabelValues(e.clientService, e.serverService).Observe(e.serverLatency.Seconds())
-		p.serviceGraphRequestClientHistogram.WithLabelValues(e.clientService, e.serverService).Observe(e.clientLatency.Seconds())
+		p.serviceGraphRequestServerHistogram.Record(ctx, e.serverLatency.Seconds(), metric.WithAttributes(attrs...))
+		p.serviceGraphRequestClientHistogram.Record(ctx, e.clientLatency.Seconds(), metric.WithAttributes(attrs...))
 	} else if e.isExpired() {
-		p.serviceGraphUnpairedSpansTotal.WithLabelValues(e.clientService, e.serverService).Inc()
+		p.serviceGraphUnpairedSpansTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
 	}
 }
 
@@ -274,6 +367,17 @@ func (p *processor) consume(trace ptrace.Traces) error {
 			continue
 		}
 
+		ctx := context.Background()
+		//TODO: Do we really have to set the server/client to an empty string?
+		attrsClient := []attribute.KeyValue{
+			attribute.Key("client").String(svc.Str()),
+			attribute.Key("server").String(""),
+		}
+		attrsServer := []attribute.KeyValue{
+			attribute.Key("client").String(""),
+			attribute.Key("server").String(svc.Str()),
+		}
+
 		ssSlice := rSpan.ScopeSpans()
 		for j := 0; j < ssSlice.Len(); j++ {
 			ils := ssSlice.At(j)
@@ -283,7 +387,7 @@ func (p *processor) consume(trace ptrace.Traces) error {
 
 				switch span.Kind() {
 				case ptrace.SpanKindClient:
-					k := key(span.TraceID().HexString(), span.SpanID().HexString())
+					k := key(hex.EncodeToString([]byte(span.TraceID().String())), hex.EncodeToString([]byte(span.SpanID().String())))
 
 					edge, err := p.store.upsertEdge(k, func(e *edge) {
 						e.clientService = svc.Str()
@@ -293,7 +397,7 @@ func (p *processor) consume(trace ptrace.Traces) error {
 
 					if errors.Is(err, errTooManyItems) {
 						totalDroppedSpans++
-						p.serviceGraphDroppedSpansTotal.WithLabelValues(svc.Str(), "").Inc()
+						p.serviceGraphDroppedSpansTotal.Add(ctx, 1, metric.WithAttributes(attrsClient...))
 						continue
 					}
 					// upsertEdge will only return this errTooManyItems
@@ -306,7 +410,7 @@ func (p *processor) consume(trace ptrace.Traces) error {
 					}
 
 				case ptrace.SpanKindServer:
-					k := key(span.TraceID().HexString(), span.ParentSpanID().HexString())
+					k := key(hex.EncodeToString([]byte(span.TraceID().String())), hex.EncodeToString([]byte(span.ParentSpanID().String())))
 
 					edge, err := p.store.upsertEdge(k, func(e *edge) {
 						e.serverService = svc.Str()
@@ -316,7 +420,7 @@ func (p *processor) consume(trace ptrace.Traces) error {
 
 					if errors.Is(err, errTooManyItems) {
 						totalDroppedSpans++
-						p.serviceGraphDroppedSpansTotal.WithLabelValues("", svc.Str()).Inc()
+						p.serviceGraphDroppedSpansTotal.Add(ctx, 1, metric.WithAttributes(attrsServer...))
 						continue
 					}
 					// upsertEdge will only return this errTooManyItems
