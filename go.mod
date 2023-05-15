@@ -613,7 +613,7 @@ require (
 
 require (
 	github.com/alecthomas/participle/v2 v2.0.0 // indirect
-	github.com/shoenig/go-m1cpu v0.1.4 // indirect
+	github.com/shoenig/go-m1cpu v0.1.6 // indirect
 	github.com/tilinna/clock v1.1.0 // indirect
 	go.opentelemetry.io/otel/bridge/opencensus v0.38.0 // indirect
 )
