@@ -447,6 +447,110 @@ func TestConverter(t *testing.T) {
 			expectLabels:    `{exporter="OTLP", level="ERROR", tenant.id="tenant_2"}`,
 			expectTimestamp: time.Date(2023, time.January, 4, 10, 10, 31, 972869000, time.UTC),
 		},
+		{
+			name: "log attributes translated to Prometheus format",
+			input: `{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "host.name",
+            "value": {
+              "stringValue": "testHost"
+            }
+          }
+        ],
+        "droppedAttributesCount": 1
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "name",
+            "version": "version",
+            "droppedAttributesCount": 1
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1672827031972869000",
+              "observedTimeUnixNano": "1672827031972869000",
+              "severityNumber": 17,
+              "severityText": "Error",
+              "body": {
+                "stringValue": "msg=\"hello world\""
+              },
+              "attributes": [
+                {
+                  "key": "sdkVersion",
+                  "value": {
+                    "stringValue": "1.0.1"
+                  }
+                },
+                {
+                  "key": "loki.format",
+                  "value": {
+                    "stringValue": "logfmt"
+                  }
+                },
+                {
+                  "key": "loki.attribute.labels",
+                  "value": {
+                    "stringValue": "mylabel_0,mylabel.1,mylabel (2),123 mylabel_3,__mylabel_4,_mylabel_5"
+                  }
+                },
+                {
+                  "key": "mylabel_0",
+                  "value": {
+                    "stringValue": "value_1"
+                  }
+                },
+                {
+                  "key": "mylabel.1",
+                  "value": {
+                    "stringValue": "value_1"
+                  }
+                },
+                {
+                  "key": "mylabel (2)",
+                  "value": {
+                    "intValue": "42"
+                  }
+                },
+                {
+                  "key": "123 mylabel_3",
+                  "value": {
+                    "stringValue": "value_3"
+                  }
+                },
+                {
+                  "key": "__mylabel_4",
+                  "value": {
+                    "stringValue": "value_3"
+                  }
+                },
+                {
+                  "key": "_mylabel_5",
+                  "value": {
+                    "stringValue": "value_3"
+                  }
+                }
+              ],
+              "droppedAttributesCount": 1,
+              "traceId": "0102030405060708090a0b0c0d0e0f10",
+              "spanId": "1112131415161718"
+            }
+          ],
+          "schemaUrl": "ScopeLogsSchemaURL"
+        }
+      ],
+      "schemaUrl": "testSchemaURL"
+    }
+  ]
+}`,
+			expectLine:      `msg="hello world" traceID=0102030405060708090a0b0c0d0e0f10 spanID=1112131415161718 severity=Error attribute_sdkVersion=1.0.1 resource_host.name=testHost`,
+			expectLabels:    `{exporter="OTLP", level="ERROR", mylabel_1="value_1", mylabel_2="42"}`,
+			expectTimestamp: time.Date(2023, time.January, 4, 10, 10, 31, 972869000, time.UTC),
+		},
 	}
 
 	decoder := &plog.JSONUnmarshaler{}
@@ -466,11 +570,17 @@ func TestConverter(t *testing.T) {
 				select {
 				case l := <-ch1:
 					require.Equal(t, tc.expectLine, l.Line)
+
+					require.NoError(t, l.Labels.Validate())
 					require.Equal(t, tc.expectLabels, l.Labels.String())
+
 					require.Equal(t, tc.expectTimestamp, l.Timestamp.UTC())
 				case l := <-ch2:
 					require.Equal(t, tc.expectLine, l.Line)
+
+					require.NoError(t, l.Labels.Validate())
 					require.Equal(t, tc.expectLabels, l.Labels.String())
+
 					require.Equal(t, tc.expectTimestamp, l.Timestamp.UTC())
 				case <-time.After(time.Second):
 					require.FailNow(t, "failed waiting for logs")

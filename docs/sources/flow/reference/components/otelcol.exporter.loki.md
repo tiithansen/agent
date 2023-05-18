@@ -11,13 +11,17 @@ to `loki` components.
 > **NOTE**: `otelcol.exporter.loki` is a custom component unrelated to the
 > `lokiexporter` from the OpenTelemetry Collector.
 >
-> Conversion of logs are done according to the OpenTelemetry
-> [Logs Data Model][] specification.
+> Conversion of logs is done according to the OpenTelemetry
+> [Logs Data Model][] specification. 
+>
+> Labels are translated to a Prometheus format according to
+> the OpenTelemetry [label translation rules].
 
 Multiple `otelcol.exporter.loki` components can be specified by giving them
 different labels.
 
 [Logs Data Model]: https://opentelemetry.io/docs/reference/specification/logs/data-model/
+[label translation rules]: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/pkg/translator/prometheus/README.md#labels
 
 ## Usage
 
