@@ -91,6 +91,8 @@ Main (unreleased)
 
 - Fix targets deduplication when clustering mode is enabled. (@laurovenancio)
 
+- Fix an issue where tailing a log file that is rotated periodically could result in a goroutine leak. (@thampiotr) 
+
 ### Other changes
 
 - Add metrics when clustering mode is enabled. (@rfratto)
